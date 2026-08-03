@@ -1,0 +1,3 @@
+// resource.rc
+// ID 1 是 Windows 约定的主应用图标（Explorer、任务栏、Alt+Tab 均读此 ID）
+1 ICON "icon.ico"
