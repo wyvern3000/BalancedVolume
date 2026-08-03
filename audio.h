@@ -4,38 +4,57 @@
 #include <atomic>
 #include <functional>
 #include <string>
+#include <vector>
+
+// 前向声明 COM 接口，避免在 audio.h 中包含 mmdeviceapi.h
+struct IMMDevice;
+
+// 单台设备的描述（用于填充下拉列表）
+struct DeviceInfo {
+    std::wstring id;        // IMMDevice::GetId() 返回的唯一 ID，设备重插不变
+    std::wstring name;      // 人类可读名称，如 "USB Audio Device"
+    bool         isDefault; // 是否为当前系统默认播放设备
+};
 
 // ---------------------------------------------------------------------------
 // AudioController
-//   固化左右声道比例：内部只保存归一化因子（较大声道 = 1.0），
-//   每次写硬件时 channel = master * factor，确保比例在 0→100 拉回时不漂移。
+//   管理一台音频端点设备的左右声道比例锁定，支持运行时切换绑定设备。
 //
-//   OnStateChanged 回调在 WASAPI 音频线程上触发，调用方务必用 PostMessage
-//   等方式切回 UI 线程再刷新界面。
+//   OnStateChanged / OnDeviceChanged 均在 WASAPI 音频线程触发，
+//   调用方必须 PostMessage 切回 UI 线程后再操作窗口。
 // ---------------------------------------------------------------------------
 class AudioController {
 public:
     AudioController();
     ~AudioController();
 
-    // 初始化 WASAPI，失败返回 false（例如无默认输出设备）
+    // 初始化枚举器并绑定到当前默认设备
     bool Initialize();
+
+    // 枚举当前所有激活的播放设备
+    std::vector<DeviceInfo> EnumerateDevices();
+
+    // 绑定到指定设备；deviceId 为空 = 绑定到当前默认设备
+    // 若设备未连接则自动回退到默认设备并返回 false
+    bool BindToDevice(const std::wstring& deviceId);
+
+    std::wstring GetCurrentDeviceId()   const;
+    std::wstring GetCurrentDeviceName() const;
 
     float        GetMaster()      const;
     float        GetLeftFactor()  const { return _leftFactor; }
     float        GetRightFactor() const { return _rightFactor; }
     std::wstring GetRatioText()   const;
 
-    // left/right 为任意正数，只取比值
     void SetBalance(float left, float right);
-    // scalar: 0.0–1.0
     void SetMasterVolume(float scalar);
 
-    // 外部（键盘/系统）改变主音量时，在音频线程上触发
-    std::function<void()> OnStateChanged;
+    std::function<void()> OnDeviceChanged;  // 系统默认设备变化（音频线程）
+    std::function<void()> OnStateChanged;   // 当前设备音量变化（音频线程）
 
-    // 由 audio.cpp 内的 VolumeCallback::OnNotify 调用（音频线程）
-    void HandleNotify();
+    // 由 audio.cpp 内部的 COM 回调对象调用（音频线程）
+    void HandleVolumeNotify();
+    void HandleDeviceNotify();
 
 private:
     static constexpr float kEpsilon = 0.002f;
@@ -44,13 +63,15 @@ private:
     float             _rightFactor = 1.0f;
     std::atomic<bool> _isBusy{false};
 
-    // WASAPI COM 对象封装在 Impl 中，避免把 mmdeviceapi.h 暴露给所有包含方
     struct Impl;
     Impl* _impl;
+
+    bool BindImpl(IMMDevice* device);
 
     void StoreNormalized(float l, float r);
     void ApplyLockedBalance();
     void ApplyLockedBalanceCore();
 
+    static std::wstring GetDeviceFriendlyName(IMMDevice* device);
     static int GCD(int a, int b);
 };

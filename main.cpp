@@ -1,8 +1,12 @@
 /*
- * BalancedVolume — 固化左右声道比例的托盘工具
- * Win32 原生版，无运行库依赖（需要 Windows Vista+ WASAPI）
+ * BalancedVolume — 固化左右声道比例的托盘工具（多设备版）
  *
- * 编译: see Makefile
+ * 弹窗布局（320×220 客户区）：
+ *   y=10  [☑ 跟随默认设备]  [设备名称下拉框          ▾]
+ *   y=50  主音量  [slider]  75%
+ *   y=96  左声道  [slider]  67
+ *   y=142 右声道  [slider]  100
+ *   y=192            固化比例: 2 : 3
  */
 
 #include <windows.h>
@@ -17,65 +21,73 @@
 #include "audio.h"
 
 // ============================================================
-//  常量与枚举
+//  常量
 // ============================================================
 
 static const wchar_t kTrayClass[]  = L"BV_TrayHost";
 static const wchar_t kPopupClass[] = L"BV_Popup";
 
-static constexpr UINT WM_TRAYNOTIFY = WM_APP + 1;  // Shell_NotifyIcon 回调
-static constexpr UINT WM_SYNC_UI   = WM_APP + 2;   // 音频线程→UI 线程同步
-static constexpr UINT TRAY_UID     = 1;
+static constexpr UINT WM_TRAYNOTIFY    = WM_APP + 1;
+static constexpr UINT WM_SYNC_UI       = WM_APP + 2;
+static constexpr UINT WM_DEVICE_CHANGE = WM_APP + 3;
+static constexpr UINT TRAY_UID         = 1;
 
-// 弹窗客户区尺寸（与 C# 版 ClientSize 一致）
-static constexpr int kPW = 320;
-static constexpr int kPH = 200;
+static constexpr int kPW = 320;   // 弹窗客户区宽
+static constexpr int kPH = 220;   // 弹窗客户区高（比旧版多 20px）
 
-// 右键菜单 ID
+// 布局 Y 坐标
+static constexpr int kDeviceRowY  = 10;  // 设备选择行
+static constexpr int kSliderStartY = 50; // 第一个滑块行
+
+static constexpr int kRowH = 46;         // 滑块行高（不变）
+
+// 菜单 ID
 enum : UINT { IDM_OPEN = 100, IDM_EXIT };
 
-// 三个滑块的索引
+// 滑块索引
 enum : int { SLD_MASTER = 0, SLD_LEFT, SLD_RIGHT, SLD_COUNT };
 
-// 滑块控件 ID（连续，方便 GetDlgCtrlID 判断）
+// 控件 ID
 enum : int {
-    ID_SLD_MASTER = 200,
-    ID_SLD_LEFT   = 201,
-    ID_SLD_RIGHT  = 202,
+    ID_SLD_MASTER = 200, ID_SLD_LEFT, ID_SLD_RIGHT,
+    ID_CHK_FOLLOW = 300,
+    ID_CMB_DEVICE = 301,
 };
 
 // ============================================================
 //  全局状态
 // ============================================================
 
-static HINSTANCE       g_hInst   = nullptr;
-static HWND            g_hTray   = nullptr;   // 隐藏宿主窗口（接收托盘消息）
-static HWND            g_hPopup  = nullptr;   // 弹出控制面板
-static HICON           g_hIcon   = nullptr;
-static AudioController* g_audio  = nullptr;
+static HINSTANCE        g_hInst        = nullptr;
+static HWND             g_hTray        = nullptr;
+static HWND             g_hPopup       = nullptr;
+static HICON            g_hIcon        = nullptr;
+static AudioController* g_audio        = nullptr;
 
-static bool g_syncing = false;  // 防止滑块↔硬件互相触发
+static bool g_syncing      = false;
+static bool g_followDefault = true;
 
-static HWND g_sliders[SLD_COUNT];    // master, left, right
-static HWND g_valLabels[SLD_COUNT];  // 对应数值文本
-static HWND g_hRatioLbl = nullptr;
+// 弹窗控件
+static HWND g_sliders[SLD_COUNT];
+static HWND g_valLabels[SLD_COUNT];
+static HWND g_hRatioLbl   = nullptr;
+static HWND g_hFollowChk  = nullptr;
+static HWND g_hDeviceCombo = nullptr;
 
-static HBRUSH g_bgBrush  = nullptr;   // RGB(30,30,30)
-static HFONT  g_uiFont   = nullptr;
+// 共享 GDI
+static HBRUSH g_bgBrush = nullptr;
+static HFONT  g_uiFont  = nullptr;
 
 // ============================================================
-//  托盘图标（动态生成，无需外部 .ico 文件）
-//  对应 C# 版 BuildTrayIcon() 中的 GDI+ 绘图逻辑
+//  图标（与之前版本完全相同）
 // ============================================================
 
 static HICON CreateSpeakerIcon() {
     constexpr int sz = 16;
-
-    // 使用 BITMAPV5HEADER + 32bpp + alpha 通道，现代 Windows 完整支持
     BITMAPV5HEADER bi  = {};
     bi.bV5Size         = sizeof(bi);
     bi.bV5Width        = sz;
-    bi.bV5Height       = -sz;   // top-down
+    bi.bV5Height       = -sz;
     bi.bV5Planes       = 1;
     bi.bV5BitCount     = 32;
     bi.bV5Compression  = BI_BITFIELDS;
@@ -91,9 +103,8 @@ static HICON CreateSpeakerIcon() {
     ReleaseDC(nullptr, dc);
     if (!hBmp) return nullptr;
 
-    // 像素格式：BGRA（内存低字节=B，高字节=A），0xFFFFFFFF = 不透明白色
     auto* p = static_cast<UINT32*>(pBits);
-    std::fill(p, p + sz * sz, 0u);  // 全透明
+    std::fill(p, p + sz * sz, 0u);
 
     auto dot = [&](int x, int y) noexcept {
         if (static_cast<unsigned>(x) < static_cast<unsigned>(sz) &&
@@ -101,39 +112,33 @@ static HICON CreateSpeakerIcon() {
             p[y * sz + x] = 0xFFFFFFFFu;
     };
 
-    // 扬声器主体矩形 [x=2..5, y=5..10]
     for (int y = 5; y <= 10; ++y)
         for (int x = 2; x <= 5; ++x)
             dot(x, y);
 
-    // 扬声器锥形（梯形，向右展开）
     for (int x = 5; x <= 10; ++x) {
         float t   = static_cast<float>(x - 5) / 5.0f;
         int   top = static_cast<int>(std::roundf(4.0f - t * 3.0f));
         int   bot = static_cast<int>(std::roundf(11.0f + t * 3.0f));
-        for (int y = top; y <= bot; ++y)
-            dot(x, y);
+        for (int y = top; y <= bot; ++y) dot(x, y);
     }
 
-    // 声波弧线（近似 C# DrawArc(11,4,3,8,-50,100) 的几个像素）
     static const int wX[] = {12, 13, 14, 14, 14, 13, 12};
     static const int wY[] = { 4,  5,  6,  7,  8,  9, 10};
     for (int i = 0; i < 7; ++i) dot(wX[i], wY[i]);
 
-    // 掩码全零 → 使用 32bpp alpha 通道控制透明度
-    const int maskRowBytes  = ((sz + 15) / 16) * 2;  // WORD 对齐
+    const int maskRowBytes = ((sz + 15) / 16) * 2;
     std::vector<BYTE> maskData(static_cast<size_t>(maskRowBytes * sz), 0);
     HBITMAP  hMask = CreateBitmap(sz, sz, 1, 1, maskData.data());
-
-    ICONINFO ii = {TRUE, 0, 0, hMask, hBmp};
-    HICON icon  = CreateIconIndirect(&ii);
+    ICONINFO ii    = {TRUE, 0, 0, hMask, hBmp};
+    HICON    icon  = CreateIconIndirect(&ii);
     DeleteObject(hMask);
     DeleteObject(hBmp);
     return icon;
 }
 
 // ============================================================
-//  托盘图标管理
+//  托盘
 // ============================================================
 
 static void TrayAdd() {
@@ -157,29 +162,160 @@ static void TrayRemove() {
 }
 
 // ============================================================
-//  弹窗：数据同步与标签刷新
+//  INI 持久化
+//
+//  [General]
+//  FollowDefault=1
+//  ActiveDevice={0.0.0.00000000}.{...}
+//
+//  [Device.{0.0.0.00000000}.{...}]
+//  Name=USB Audio Device
+//  Left=67
+//  Right=100
+// ============================================================
+
+static std::wstring GetIniPath() {
+    wchar_t buf[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    wchar_t* sep = wcsrchr(buf, L'\\');
+    if (sep) sep[1] = L'\0';
+    return std::wstring(buf) + L"BalancedVolume.ini";
+}
+
+// 保存 [General] 节
+static void SaveGeneralSettings() {
+    const std::wstring path = GetIniPath();
+    WritePrivateProfileStringW(L"General", L"FollowDefault",
+        g_followDefault ? L"1" : L"0", path.c_str());
+    if (!g_followDefault) {
+        const std::wstring id = g_audio->GetCurrentDeviceId();
+        if (!id.empty())
+            WritePrivateProfileStringW(L"General", L"ActiveDevice",
+                id.c_str(), path.c_str());
+    }
+}
+
+// 保存当前设备的平衡到对应 [Device.{id}] 节
+static void SaveDeviceBalance() {
+    const std::wstring path    = GetIniPath();
+    const std::wstring id      = g_audio->GetCurrentDeviceId();
+    const std::wstring name    = g_audio->GetCurrentDeviceName();
+    const std::wstring section = L"Device." + id;
+    wchar_t val[16];
+
+    WritePrivateProfileStringW(section.c_str(), L"Name",
+        name.c_str(), path.c_str());
+
+    int l = std::clamp(
+        static_cast<int>(std::roundf(g_audio->GetLeftFactor()  * 100.0f)), 0, 100);
+    int r = std::clamp(
+        static_cast<int>(std::roundf(g_audio->GetRightFactor() * 100.0f)), 0, 100);
+    swprintf_s(val, L"%d", l);
+    WritePrivateProfileStringW(section.c_str(), L"Left",  val, path.c_str());
+    swprintf_s(val, L"%d", r);
+    WritePrivateProfileStringW(section.c_str(), L"Right", val, path.c_str());
+}
+
+// 从 [Device.{id}] 节加载并应用平衡；找不到则默认 1:1
+static void LoadDeviceBalance(const std::wstring& deviceId) {
+    const std::wstring path    = GetIniPath();
+    const std::wstring section = L"Device." + deviceId;
+    int l = static_cast<int>(
+        GetPrivateProfileIntW(section.c_str(), L"Left",  -1, path.c_str()));
+    int r = static_cast<int>(
+        GetPrivateProfileIntW(section.c_str(), L"Right", -1, path.c_str()));
+    if (l >= 0 && r >= 0 && (l > 0 || r > 0))
+        g_audio->SetBalance(static_cast<float>(l), static_cast<float>(r));
+    else
+        g_audio->SetBalance(100.0f, 100.0f);  // 该设备无记录，默认 1:1
+}
+
+// 启动时读取 [General] 并完成初始设备绑定
+static void LoadGeneralSettings() {
+    const std::wstring path = GetIniPath();
+
+    // FollowDefault 默认为 true（首次启动无 ini）
+    int follow = static_cast<int>(
+        GetPrivateProfileIntW(L"General", L"FollowDefault", 1, path.c_str()));
+    g_followDefault = (follow != 0);
+
+    if (g_followDefault) {
+        // 绑定到默认设备（Initialize() 已完成，这里只加载平衡）
+        LoadDeviceBalance(g_audio->GetCurrentDeviceId());
+    } else {
+        // 尝试绑定到保存的设备
+        wchar_t idBuf[512] = {};
+        GetPrivateProfileStringW(L"General", L"ActiveDevice", L"",
+            idBuf, 512, path.c_str());
+
+        if (idBuf[0] != L'\0') {
+            bool found = g_audio->BindToDevice(idBuf);
+            if (!found) {
+                // 设备未连接，已自动回退到默认设备
+                // 保持 g_followDefault = false（下次接入时再生效）
+            }
+        }
+        LoadDeviceBalance(g_audio->GetCurrentDeviceId());
+    }
+}
+
+// ============================================================
+//  弹窗：设备下拉框同步
+// ============================================================
+
+// 填充设备列表并选中当前设备；每次 ShowPopup 调用一次
+static void SyncDeviceCombo() {
+    SendMessage(g_hDeviceCombo, CB_RESETCONTENT, 0, 0);
+
+    const std::vector<DeviceInfo> devices = g_audio->EnumerateDevices();
+    const std::wstring curId = g_audio->GetCurrentDeviceId();
+    int selectIdx = 0;
+
+    for (int i = 0; i < static_cast<int>(devices.size()); ++i) {
+        const auto& d = devices[i];
+        // 默认设备在名称后加星号标注
+        std::wstring label = d.isDefault ? (d.name + L"  ★") : d.name;
+        int idx = static_cast<int>(
+            SendMessage(g_hDeviceCombo, CB_ADDSTRING, 0,
+                        reinterpret_cast<LPARAM>(label.c_str())));
+        // 用 CB_SETITEMDATA 存设备索引，以便通过 combo index 反查 devices[]
+        SendMessage(g_hDeviceCombo, CB_SETITEMDATA, static_cast<WPARAM>(idx),
+                    static_cast<LPARAM>(i));
+        if (d.id == curId) selectIdx = idx;
+    }
+
+    SendMessage(g_hDeviceCombo, CB_SETCURSEL,
+                static_cast<WPARAM>(selectIdx), 0);
+
+    // 跟随默认时禁用下拉（只能看到当前默认，不能手动切换）
+    EnableWindow(g_hDeviceCombo, g_followDefault ? FALSE : TRUE);
+
+    // 同步复选框状态
+    SendMessage(g_hFollowChk, BM_SETCHECK,
+                g_followDefault ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+// ============================================================
+//  弹窗：平衡滑块同步
 // ============================================================
 
 static void RefreshLabels() {
     wchar_t buf[32];
-
     int mv = static_cast<int>(SendMessage(g_sliders[SLD_MASTER], TBM_GETPOS, 0, 0));
     int lv = static_cast<int>(SendMessage(g_sliders[SLD_LEFT],   TBM_GETPOS, 0, 0));
     int rv = static_cast<int>(SendMessage(g_sliders[SLD_RIGHT],  TBM_GETPOS, 0, 0));
-
     swprintf_s(buf, L"%d%%", mv); SetWindowText(g_valLabels[SLD_MASTER], buf);
     swprintf_s(buf, L"%d",   lv); SetWindowText(g_valLabels[SLD_LEFT],   buf);
     swprintf_s(buf, L"%d",   rv); SetWindowText(g_valLabels[SLD_RIGHT],  buf);
-
     SetWindowText(g_hRatioLbl,
         (std::wstring(L"固化比例: ") + g_audio->GetRatioText()).c_str());
 }
 
-// 将音频控制器的比例因子同步到左右滑块
 static void SyncSlidersToFactors() {
     g_syncing = true;
     auto setPos = [](HWND hw, float factor) {
-        int v = std::clamp(static_cast<int>(std::roundf(factor * 100.0f)), 0, 100);
+        int v = std::clamp(
+            static_cast<int>(std::roundf(factor * 100.0f)), 0, 100);
         SendMessage(hw, TBM_SETPOS, TRUE, static_cast<LPARAM>(v));
     };
     setPos(g_sliders[SLD_LEFT],  g_audio->GetLeftFactor());
@@ -187,7 +323,6 @@ static void SyncSlidersToFactors() {
     g_syncing = false;
 }
 
-// 全量同步（弹窗首次显示 / 硬件音量变化时）
 static void SyncAll() {
     SyncSlidersToFactors();
     g_syncing = true;
@@ -207,103 +342,64 @@ static void PositionPopup() {
     SystemParametersInfo(SPI_GETWORKAREA, 0, &work, 0);
     RECT win{};
     GetWindowRect(g_hPopup, &win);
-    int w = win.right - win.left;
-    int h = win.bottom - win.top;
     SetWindowPos(g_hPopup, HWND_TOPMOST,
-                 work.right - w - 12,
-                 work.bottom - h - 12,
+                 work.right  - (win.right  - win.left) - 12,
+                 work.bottom - (win.bottom - win.top)  - 12,
                  0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 static void ShowPopup() {
+    SyncDeviceCombo();   // 每次弹出时刷新设备列表
     SyncAll();
     PositionPopup();
     ShowWindow(g_hPopup, SW_SHOW);
     SetForegroundWindow(g_hPopup);
 }
 
-static void HidePopup() {
-    ShowWindow(g_hPopup, SW_HIDE);
-}
+static void HidePopup() { ShowWindow(g_hPopup, SW_HIDE); }
 
 static void TogglePopup() {
     if (IsWindowVisible(g_hPopup)) HidePopup(); else ShowPopup();
 }
 
 // ============================================================
-//  INI 持久化
-//  文件位置：exe 同目录 BalancedVolume.ini
-//  格式：
-//    [Balance]
-//    Left=67
-//    Right=100
-// ============================================================
-
-static std::wstring GetIniPath() {
-    wchar_t buf[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    wchar_t* sep = wcsrchr(buf, L'\\');
-    if (sep) sep[1] = L'\0';   // 保留末尾反斜杠，截掉文件名
-    return std::wstring(buf) + L"BalancedVolume.ini";
-}
-
-// 将当前比例因子以 0–100 整数写入 ini（方便手动编辑）
-static void SaveIni() {
-    const std::wstring path = GetIniPath();
-    wchar_t val[16];
-    int l = std::clamp(
-        static_cast<int>(std::roundf(g_audio->GetLeftFactor()  * 100.0f)), 0, 100);
-    int r = std::clamp(
-        static_cast<int>(std::roundf(g_audio->GetRightFactor() * 100.0f)), 0, 100);
-    swprintf_s(val, L"%d", l);
-    WritePrivateProfileStringW(L"Balance", L"Left",  val, path.c_str());
-    swprintf_s(val, L"%d", r);
-    WritePrivateProfileStringW(L"Balance", L"Right", val, path.c_str());
-}
-
-// 读取并应用；ini 不存在时静默跳过，保持硬件当前状态
-static void LoadIni() {
-    const std::wstring path = GetIniPath();
-    // 用 -1 作哨兵：若键不存在 GetPrivateProfileInt 返回默认值 -1
-    int l = static_cast<int>(
-        GetPrivateProfileIntW(L"Balance", L"Left",  -1, path.c_str()));
-    int r = static_cast<int>(
-        GetPrivateProfileIntW(L"Balance", L"Right", -1, path.c_str()));
-    if (l < 0 || r < 0)   return;   // 文件或键不存在
-    if (l == 0 && r == 0) return;   // 无效值
-    g_audio->SetBalance(static_cast<float>(l), static_cast<float>(r));
-}
-
-// ============================================================
-//  弹窗控件创建（对应 C# ControlForm 布局）
-//
-//  布局（客户区 320×200）:
-//    y=12  [ 主音量 ][===slider===] 75%
-//    y=58  [ 左声道 ][===slider===] 67
-//    y=104 [ 右声道 ][===slider===] 100
-//    y=152          固化比例: 2 : 3
+//  弹窗控件创建
 // ============================================================
 
 static void BuildPopupControls(HWND hWnd) {
-    constexpr int col0 = 10, col1 = 68, col2 = 260;
-    constexpr int rowH = 46, startY = 12;
+    // ── 设备选择行 ─────────────────────────────────────────────────────────
+    g_hFollowChk = CreateWindowW(L"BUTTON", L"跟随默认设备",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        10, kDeviceRowY + 4, 110, 20,
+        hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_CHK_FOLLOW)),
+        g_hInst, nullptr);
+    SendMessage(g_hFollowChk, WM_SETFONT,
+                reinterpret_cast<WPARAM>(g_uiFont), TRUE);
 
-    static const wchar_t* kRowLabels[] = {L"主音量", L"左声道", L"右声道"};
+    g_hDeviceCombo = CreateWindowW(L"COMBOBOX", nullptr,
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP,
+        124, kDeviceRowY, 188, 200,   // 高度 200 = 下拉列表最大高度
+        hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_CMB_DEVICE)),
+        g_hInst, nullptr);
+    SendMessage(g_hDeviceCombo, WM_SETFONT,
+                reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+
+    // ── 三行滑块 ────────────────────────────────────────────────────────────
+    static const wchar_t* kLabels[] = {L"主音量", L"左声道", L"右声道"};
 
     for (int i = 0; i < SLD_COUNT; ++i) {
-        int y = startY + i * rowH;
+        int y = kSliderStartY + i * kRowH;
 
-        // 行标题（右对齐）
-        HWND hTitle = CreateWindowW(L"STATIC", kRowLabels[i],
+        HWND hTitle = CreateWindowW(L"STATIC", kLabels[i],
             WS_CHILD | WS_VISIBLE | SS_RIGHT,
-            col0, y + 8, 55, 30,
+            10, y + 8, 55, 30,
             hWnd, nullptr, g_hInst, nullptr);
-        SendMessage(hTitle, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+        SendMessage(hTitle, WM_SETFONT,
+                    reinterpret_cast<WPARAM>(g_uiFont), TRUE);
 
-        // 滑块
         HWND hSld = CreateWindowW(TRACKBAR_CLASS, nullptr,
             WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-            col1, y + 2, 185, 30,
+            68, y + 2, 185, 30,
             hWnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_SLD_MASTER + i)),
             g_hInst, nullptr);
@@ -311,22 +407,23 @@ static void BuildPopupControls(HWND hWnd) {
         SendMessage(hSld, TBM_SETPAGESIZE, 0,     10);
         g_sliders[i] = hSld;
 
-        // 数值标签
         HWND hVal = CreateWindowW(L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            col2, y + 8, 48, 30,
+            260, y + 8, 48, 30,
             hWnd, nullptr, g_hInst, nullptr);
-        SendMessage(hVal, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+        SendMessage(hVal, WM_SETFONT,
+                    reinterpret_cast<WPARAM>(g_uiFont), TRUE);
         g_valLabels[i] = hVal;
     }
 
-    // 比例说明标签
-    int ry = startY + SLD_COUNT * rowH + 2;
+    // ── 比例说明标签 ────────────────────────────────────────────────────────
+    int ry = kSliderStartY + SLD_COUNT * kRowH + 2;
     g_hRatioLbl = CreateWindowW(L"STATIC", L"",
         WS_CHILD | WS_VISIBLE | SS_CENTER,
         10, ry, 300, 22,
         hWnd, nullptr, g_hInst, nullptr);
-    SendMessage(g_hRatioLbl, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+    SendMessage(g_hRatioLbl, WM_SETFONT,
+                reinterpret_cast<WPARAM>(g_uiFont), TRUE);
 }
 
 // ============================================================
@@ -338,12 +435,10 @@ static LRESULT CALLBACK PopupProc(HWND hWnd, UINT msg,
 {
     switch (msg) {
 
-    // ── 创建 ────────────────────────────────────────────────────────────
     case WM_CREATE:
         BuildPopupControls(hWnd);
         return 0;
 
-    // ── 背景（深色）────────────────────────────────────────────────────
     case WM_ERASEBKGND: {
         RECT rc{};
         GetClientRect(hWnd, &rc);
@@ -358,32 +453,29 @@ static LRESULT CALLBACK PopupProc(HWND hWnd, UINT msg,
         return 0;
     }
 
-    // ── STATIC 标签颜色（深底浅字）─────────────────────────────────────
+    // Static 标签：深底浅字
     case WM_CTLCOLORSTATIC: {
         HDC hdc = reinterpret_cast<HDC>(wParam);
         SetTextColor(hdc, RGB(220, 220, 220));
         SetBkColor(hdc, RGB(30, 30, 30));
         return reinterpret_cast<LRESULT>(g_bgBrush);
     }
+    // 复选框同上
+    case WM_CTLCOLORBTN: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, RGB(220, 220, 220));
+        SetBkColor(hdc, RGB(30, 30, 30));
+        return reinterpret_cast<LRESULT>(g_bgBrush);
+    }
 
-    // ── 滑块变化（WM_HSCROLL 由子 TRACKBAR_CLASS 控件发给父窗口）───────
-    //
-    //  LOWORD(wParam) 通知码说明：
-    //    SB_THUMBTRACK    — 鼠标按住拖动中（实时）
-    //    SB_ENDSCROLL     — 鼠标松开 / 键盘键释放（操作结束）
-    //    SB_LINE*/SB_PAGE* — 键盘箭头/翻页（每次按下触发一次）
-    //
-    //  策略：所有通知码都实时更新音频；仅在 SB_ENDSCROLL 时保存 ini，
-    //        避免拖动过程中频繁写文件。
+    // ── 滑块 ──────────────────────────────────────────────────────────────
     case WM_HSCROLL: {
         if (g_syncing) return 0;
-
         HWND hSld = reinterpret_cast<HWND>(lParam);
         int  id   = GetDlgCtrlID(hSld);
         int  code = LOWORD(wParam);
 
         if (id == ID_SLD_MASTER) {
-            // 主音量不写 ini（主音量由系统自己持久化）
             if (code != SB_ENDSCROLL) {
                 int v = static_cast<int>(SendMessage(hSld, TBM_GETPOS, 0, 0));
                 g_audio->SetMasterVolume(v / 100.0f);
@@ -391,30 +483,72 @@ static LRESULT CALLBACK PopupProc(HWND hWnd, UINT msg,
             }
         } else if (id == ID_SLD_LEFT || id == ID_SLD_RIGHT) {
             if (code != SB_ENDSCROLL) {
-                // 拖动 / 按键期间：实时更新音频
                 int l = static_cast<int>(
                     SendMessage(g_sliders[SLD_LEFT],  TBM_GETPOS, 0, 0));
                 int r = static_cast<int>(
                     SendMessage(g_sliders[SLD_RIGHT], TBM_GETPOS, 0, 0));
                 g_audio->SetBalance(static_cast<float>(l),
                                      static_cast<float>(r));
-                SyncSlidersToFactors();   // 归一化后同步回滑块
+                SyncSlidersToFactors();
                 RefreshLabels();
             } else {
-                // 松开时：保存比例到 ini
-                SaveIni();
+                SaveDeviceBalance();   // 松开时保存到当前设备的 ini 节
             }
         }
         return 0;
     }
 
-    // ── 失去焦点自动隐藏（对应 C# Deactivate 事件）─────────────────────
+    // ── 复选框 / 下拉框 ────────────────────────────────────────────────────
+    case WM_COMMAND: {
+        int id   = LOWORD(wParam);
+        int code = HIWORD(wParam);
+
+        // "跟随默认设备" 复选框
+        if (id == ID_CHK_FOLLOW && code == BN_CLICKED) {
+            g_followDefault =
+                (SendMessage(g_hFollowChk, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            EnableWindow(g_hDeviceCombo, g_followDefault ? FALSE : TRUE);
+
+            if (g_followDefault) {
+                // 立即切到默认设备
+                g_audio->BindToDevice(L"");
+                LoadDeviceBalance(g_audio->GetCurrentDeviceId());
+                SyncDeviceCombo();
+                SyncAll();
+            }
+            SaveGeneralSettings();
+        }
+
+        // 设备下拉框选择变化
+        else if (id == ID_CMB_DEVICE && code == CBN_SELCHANGE) {
+            int idx = static_cast<int>(
+                SendMessage(g_hDeviceCombo, CB_GETCURSEL, 0, 0));
+            if (idx == CB_ERR) break;
+
+            // 取出该条目存的 devices[] 下标，再从 EnumerateDevices 重查 ID
+            // （简化：直接重新枚举，因为 EnumerateDevices 很快）
+            auto devices = g_audio->EnumerateDevices();
+            int  dataIdx = static_cast<int>(
+                SendMessage(g_hDeviceCombo, CB_GETITEMDATA,
+                            static_cast<WPARAM>(idx), 0));
+
+            if (dataIdx >= 0 && dataIdx < static_cast<int>(devices.size())) {
+                const std::wstring& newId = devices[dataIdx].id;
+                if (newId != g_audio->GetCurrentDeviceId()) {
+                    g_audio->BindToDevice(newId);
+                    LoadDeviceBalance(newId);
+                    SyncAll();
+                    SaveGeneralSettings();
+                }
+            }
+        }
+        return 0;
+    }
+
     case WM_ACTIVATE:
-        if (LOWORD(wParam) == WA_INACTIVE)
-            HidePopup();
+        if (LOWORD(wParam) == WA_INACTIVE) HidePopup();
         return 0;
 
-    // ── 点关闭只隐藏，不销毁（托盘应用生命周期）────────────────────────
     case WM_CLOSE:
         HidePopup();
         return 0;
@@ -424,7 +558,7 @@ static LRESULT CALLBACK PopupProc(HWND hWnd, UINT msg,
 }
 
 // ============================================================
-//  托盘宿主窗口过程（隐藏，仅接收消息）
+//  托盘宿主窗口过程
 // ============================================================
 
 static LRESULT CALLBACK TrayProc(HWND hWnd, UINT msg,
@@ -432,7 +566,6 @@ static LRESULT CALLBACK TrayProc(HWND hWnd, UINT msg,
 {
     switch (msg) {
 
-    // ── 托盘图标事件 ────────────────────────────────────────────────────
     case WM_TRAYNOTIFY:
         switch (lParam) {
         case WM_LBUTTONUP:
@@ -440,27 +573,25 @@ static LRESULT CALLBACK TrayProc(HWND hWnd, UINT msg,
             break;
         case WM_RBUTTONUP:
         case WM_CONTEXTMENU: {
-            // SetForegroundWindow 必须在 TrackPopupMenu 之前调用，
-            // 否则菜单在点击外部区域后不能正常消失
             POINT pt{};
             GetCursorPos(&pt);
             SetForegroundWindow(hWnd);
             HMENU hMenu = CreatePopupMenu();
-            AppendMenuW(hMenu, MF_STRING,    IDM_OPEN, L"\u2699 \u6253\u5f00\u63a7\u5236\u9762\u677f");  // ⚙ 打开控制面板
-            AppendMenuW(hMenu, MF_SEPARATOR, 0,        nullptr);
-            AppendMenuW(hMenu, MF_STRING,    IDM_EXIT, L"\u2715 \u9000\u51fa");  // ✕ 退出
+            AppendMenuW(hMenu, MF_STRING,    IDM_OPEN,
+                        L"\u2699 \u6253\u5f00\u63a7\u5236\u9762\u677f");
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hMenu, MF_STRING,    IDM_EXIT,
+                        L"\u2715 \u9000\u51fa");
             TrackPopupMenu(hMenu,
-                           TPM_BOTTOMALIGN | TPM_RIGHTALIGN | TPM_RIGHTBUTTON,
-                           pt.x, pt.y, 0, hWnd, nullptr);
+                TPM_BOTTOMALIGN | TPM_RIGHTALIGN | TPM_RIGHTBUTTON,
+                pt.x, pt.y, 0, hWnd, nullptr);
             DestroyMenu(hMenu);
-            // PostMessage(WM_NULL) 修正：确保宿主窗口能正确恢复前景状态
             PostMessage(hWnd, WM_NULL, 0, 0);
             break;
         }
         }
         return 0;
 
-    // ── 菜单命令 ────────────────────────────────────────────────────────
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDM_OPEN: TogglePopup(); break;
@@ -471,10 +602,21 @@ static LRESULT CALLBACK TrayProc(HWND hWnd, UINT msg,
         }
         return 0;
 
-    // ── 音频线程通知：硬件音量被外部改变，刷新弹窗 ─────────────────────
+    // 音频线程通知：当前设备音量被外部改变
     case WM_SYNC_UI:
-        if (IsWindowVisible(g_hPopup))
-            SyncAll();
+        if (IsWindowVisible(g_hPopup)) SyncAll();
+        return 0;
+
+    // 系统默认播放设备已切换
+    case WM_DEVICE_CHANGE:
+        if (g_followDefault) {
+            g_audio->BindToDevice(L"");                        // 绑定到新默认
+            LoadDeviceBalance(g_audio->GetCurrentDeviceId());  // 加载该设备的平衡
+            if (IsWindowVisible(g_hPopup)) {
+                SyncDeviceCombo();
+                SyncAll();
+            }
+        }
         return 0;
 
     case WM_DESTROY:
@@ -492,18 +634,15 @@ static LRESULT CALLBACK TrayProc(HWND hWnd, UINT msg,
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     g_hInst = hInstance;
 
-    // COM 初始化（STA，与 C# Application.Run 一致）
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
-    // 初始化公共控件（需要 TRACKBAR_CLASS）
     INITCOMMONCONTROLSEX icex{sizeof(icex), ICC_BAR_CLASSES};
     InitCommonControlsEx(&icex);
 
-    // ── 共享 GDI 资源 ────────────────────────────────────────────────────
+    // 共享 GDI 资源
     g_bgBrush = CreateSolidBrush(RGB(30, 30, 30));
     {
         HDC dc = GetDC(nullptr);
-        // 9pt Microsoft YaHei UI，与 C# new Font("Microsoft YaHei UI", 9f) 对应
         g_uiFont = CreateFontW(
             -MulDiv(9, GetDeviceCaps(dc, LOGPIXELSY), 72),
             0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -514,87 +653,74 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
     g_hIcon = CreateSpeakerIcon();
 
-    // ── 注册窗口类 ───────────────────────────────────────────────────────
+    // 注册窗口类
     WNDCLASSEXW wc{};
     wc.cbSize    = sizeof(wc);
     wc.hInstance = hInstance;
     wc.hCursor   = LoadCursor(nullptr, IDC_ARROW);
     wc.hIcon     = g_hIcon;
 
-    // 托盘宿主（隐藏）
     wc.lpfnWndProc   = TrayProc;
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     wc.lpszClassName = kTrayClass;
     RegisterClassExW(&wc);
 
-    // 弹窗
     wc.lpfnWndProc   = PopupProc;
     wc.hbrBackground = g_bgBrush;
     wc.lpszClassName = kPopupClass;
     RegisterClassExW(&wc);
 
-    // ── 创建托盘宿主（WS_POPUP + 零尺寸 = 不可见，但可接收消息）────────
-    g_hTray = CreateWindowExW(
-        WS_EX_TOOLWINDOW,        // 不出现在任务栏
-        kTrayClass, L"BalancedVolume",
-        WS_POPUP,
-        0, 0, 0, 0,
-        nullptr, nullptr, hInstance, nullptr);
-
+    // 隐藏托盘宿主
+    g_hTray = CreateWindowExW(WS_EX_TOOLWINDOW,
+        kTrayClass, L"BalancedVolume", WS_POPUP,
+        0, 0, 0, 0, nullptr, nullptr, hInstance, nullptr);
     if (!g_hTray) { CoUninitialize(); return 1; }
 
-    // ── 创建弹窗（初始隐藏）─────────────────────────────────────────────
+    // 弹窗（客户区 320×220）
     {
         constexpr DWORD style   = WS_POPUP | WS_BORDER;
         constexpr DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
         RECT rc = {0, 0, kPW, kPH};
-        AdjustWindowRectEx(&rc, style, FALSE, exStyle);  // 将客户区尺寸转为窗口尺寸
-
-        g_hPopup = CreateWindowExW(
-            exStyle, kPopupClass, L"音量平衡控制器",
-            style,
-            0, 0,
-            rc.right - rc.left,   // 窗口宽（含边框）
-            rc.bottom - rc.top,   // 窗口高（含边框）
+        AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+        g_hPopup = CreateWindowExW(exStyle, kPopupClass, L"音量平衡控制器",
+            style, 0, 0,
+            rc.right - rc.left, rc.bottom - rc.top,
             nullptr, nullptr, hInstance, nullptr);
     }
-
     if (!g_hPopup) { CoUninitialize(); return 1; }
 
-    // ── 初始化音频控制器 ─────────────────────────────────────────────────
+    // 音频初始化
     g_audio = new AudioController();
     if (!g_audio->Initialize()) {
         MessageBoxW(nullptr,
             L"无法访问默认音频输出端点。\n请检查系统音频设置后重试。",
-            L"BalancedVolume 错误",
-            MB_ICONERROR | MB_OK);
+            L"BalancedVolume 错误", MB_ICONERROR | MB_OK);
         delete g_audio;
         CoUninitialize();
         return 1;
     }
 
-    // ini 存在则用保存的比例覆盖硬件当前状态（在注册回调前调用，
-    // 避免 SetBalance 触发 OnStateChanged 时 g_hTray 尚未准备好）
-    LoadIni();
+    // 读取 ini：确定跟随模式、绑定目标设备、加载平衡
+    LoadGeneralSettings();
 
-    // 音频线程回调 → PostMessage → UI 线程处理（不直接操作 HWND）
+    // 线程安全回调：音频线程 → PostMessage → UI 线程
     g_audio->OnStateChanged = [] {
         PostMessage(g_hTray, WM_SYNC_UI, 0, 0);
     };
+    g_audio->OnDeviceChanged = [] {
+        PostMessage(g_hTray, WM_DEVICE_CHANGE, 0, 0);
+    };
 
-    // ── 添加托盘图标 ─────────────────────────────────────────────────────
     TrayAdd();
 
-    // ── 消息循环 ─────────────────────────────────────────────────────────
     MSG msg{};
     while (GetMessage(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
-    // ── 清理（COM 注销必须在 CoUninitialize 之前）────────────────────────
     TrayRemove();
-    delete g_audio;      // 析构中 UnregisterControlChangeNotify 并释放 COM 接口
+    delete g_audio;
     g_audio = nullptr;
 
     if (g_uiFont)  DeleteObject(g_uiFont);
